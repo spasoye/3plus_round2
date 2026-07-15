@@ -78,8 +78,11 @@ typedef struct {
 
 static parser_ctx_t ctx;
 
-/* Bail out of whatever frame is in progress, report it, then let `b` be
- * re-examined as the possible start of a new preamble. */
+/**
+ * Aborts the current frame and reports its status.
+ * @param status The status to report.
+ * @param b The byte that caused the abort (used to determine next state).
+ */
 static void abort_frame(frame_status_t status, uint8_t b) {
     ctx.cb(status, 0, NULL, 0, ctx.user);
     if (b == 0xAA || b == 0x55) {
@@ -90,6 +93,11 @@ static void abort_frame(frame_status_t status, uint8_t b) {
     }
 }
 
+/**
+ * Checks if a byte is a valid escaped byte.
+ * @param b The byte to check.
+ * @return true if the byte is valid, false otherwise.
+ */
 static bool is_valid_escaped_byte(uint8_t b) {
     /* Only these bytes may legally follow an escape marker. */
     return b == (uint8_t)(0xAA ^ ESCAPE_XOR)
@@ -97,7 +105,7 @@ static bool is_valid_escaped_byte(uint8_t b) {
         || b == (uint8_t)(ESCAPE_MARKER ^ ESCAPE_XOR);
 }
 
-/*
+/**
  * Finishes the current frame and reports its status.
  * @param received_crc The CRC byte received with the frame.
  */
@@ -111,6 +119,11 @@ static void finish_frame(uint8_t received_crc) {
     ctx.state = SM_SYNC0;
 }
 
+/**
+ * Resets the parser state.
+ * @param cb The callback function to use.
+ * @param user The user data for the callback.
+ */
 void parser_reset(frame_cb_t cb, void *user) {
     ctx.state = SM_SYNC0;
     ctx.cb = cb;
