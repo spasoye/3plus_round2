@@ -50,26 +50,175 @@ void parser_feed(uint8_t b);
 uint8_t crc8_maxim(const uint8_t *data, size_t len);
 
 /* ------------------- VAŠA IMPLEMENTACIJA (dopuniti) -------------------------*/
+#define MAX_FRAME_DATA  64
+#define ESCAPE_MARKER 0x7D
+#define ESCAPE_XOR    0x20
 
-/* TODO: definirajte interno stanje parsera (state machine) ovdje. */
+/* Parser state machine states */
+typedef enum {
+    SM_SYNC0,           /* first preamble byte: 0xAA or 0x55 */
+    SM_SYNC1,           /* second preamble byte */
+    SM_LEN,             /* waiting for length byte (cmd+payload) */
+    SM_DATA,            /* consuming/unescaping `len` bytes of cmd+payload */
+    SM_DATA_ESC,        /* previous raw byte was the 0x7D escape marker, in DATA */
+    SM_CRC,             /* consuming/unescaping the final CRC byte */
+    SM_CRC_ESC,         /* previous raw byte was 0x7D, in CRC */
+} parser_state_t;
+
+/* parser context state */
+typedef struct {
+    parser_state_t state;                   /* current parser state */
+    uint8_t        sync0;                   /* first preamble byte seen */
+    uint8_t        len;                     /* decoded length announced by frame */
+    uint8_t        data[MAX_FRAME_DATA];    /* cmd and payload */
+    uint8_t        data_idx;                /* index into data[] */
+    frame_cb_t     cb;                      /* callback function */
+    void          *user;
+} parser_ctx_t;
+
+static parser_ctx_t ctx;
+
+/* Bail out of whatever frame is in progress, report it, then let `b` be
+ * re-examined as the possible start of a new preamble. */
+static void abort_frame(frame_status_t status, uint8_t b) {
+    ctx.cb(status, 0, NULL, 0, ctx.user);
+    if (b == 0xAA || b == 0x55) {
+        ctx.sync0 = b;
+        ctx.state = SM_SYNC1;
+    } else {
+        ctx.state = SM_SYNC0;
+    }
+}
+
+static bool is_valid_escaped_byte(uint8_t b) {
+    /* Only these bytes may legally follow an escape marker. */
+    return b == (uint8_t)(0xAA ^ ESCAPE_XOR)
+        || b == (uint8_t)(0x55 ^ ESCAPE_XOR)
+        || b == (uint8_t)(ESCAPE_MARKER ^ ESCAPE_XOR);
+}
+
+/*
+ * Finishes the current frame and reports its status.
+ * @param received_crc The CRC byte received with the frame.
+ */
+static void finish_frame(uint8_t received_crc) {
+    uint8_t expected = crc8_maxim(ctx.data, (size_t)ctx.len + 1);
+    if (received_crc == expected) {
+        ctx.cb(FRAME_OK, ctx.data[1], &ctx.data[2], (size_t)ctx.len - 1, ctx.user);
+    } else {
+        ctx.cb(FRAME_BAD_CRC, 0, NULL, 0, ctx.user);
+    }
+    ctx.state = SM_SYNC0;
+}
 
 void parser_reset(frame_cb_t cb, void *user) {
-    (void)cb; (void)user;
-    /* TODO */
+    ctx.state = SM_SYNC0;
+    ctx.cb = cb;
+    ctx.user = user;
 }
 
 void parser_feed(uint8_t b) {
-    (void)b;
-    /* TODO: state machine
-     *   1) Sinkronizacija na preamble (0xAA 0x55 ili 0x55 0xAA)
-     *   2) ...
-     */
+    switch (ctx.state) {
+
+    case SM_SYNC0:
+        if (b == 0xAA || b == 0x55) {
+            ctx.sync0 = b;
+            // Next state
+            ctx.state = SM_SYNC1;
+        }
+        break;
+
+    case SM_SYNC1:
+        /* 0xAA ^ 0x55 == 0xFF mindblown... */
+        if ((uint8_t)(ctx.sync0 ^ b) == 0xFF) {
+            // Next state
+            ctx.state = SM_LEN;
+        }
+        else if (b == 0xAA || b == 0x55) {
+            /* restart pairing from this byte */
+            ctx.sync0 = b;
+        }
+        else {
+            ctx.state = SM_SYNC0;
+        }
+        break;
+
+    case SM_LEN:
+        ctx.len = b;
+        ctx.data_idx = 0;
+        if (ctx.len == 0 || ctx.len >= MAX_FRAME_DATA) {
+            abort_frame(FRAME_BAD_LENGTH, b);
+            break;
+        }
+
+        ctx.data[ctx.data_idx] = b;
+        ctx.data_idx++;
+
+        ctx.state = SM_DATA;
+        break;
+
+    case SM_DATA:
+        if (b == ESCAPE_MARKER) {
+            ctx.state = SM_DATA_ESC;
+        }
+        else if(b == 0xAA || b == 0x55){
+            abort_frame(FRAME_TRUNCATED, b);
+        }
+        else {
+            ctx.data[ctx.data_idx++] = b;
+            if (ctx.data_idx == (size_t)ctx.len + 1) ctx.state = SM_CRC;
+        }
+        break;
+
+    case SM_DATA_ESC:
+        if (!is_valid_escaped_byte(b)) {
+            abort_frame(FRAME_BAD_ESCAPE, b);
+            break;
+        }
+        ctx.data[ctx.data_idx++] = (uint8_t)(b ^ ESCAPE_XOR);
+        ctx.state = (ctx.data_idx == (size_t)ctx.len + 1) ? SM_CRC : SM_DATA;
+        break;
+
+    case SM_CRC:
+        if (b == ESCAPE_MARKER) {
+            ctx.state = SM_CRC_ESC;
+            break;
+        }
+        if (b == 0xAA || b == 0x55){
+            abort_frame(FRAME_TRUNCATED, b);
+            break;
+        }
+        finish_frame(b);
+        break;
+
+    case SM_CRC_ESC:
+        if (!is_valid_escaped_byte(b)) {
+            abort_frame(FRAME_BAD_ESCAPE, b);
+            break;
+        }
+        finish_frame((uint8_t)(b ^ ESCAPE_XOR));
+        break;
+    }
 }
 
 uint8_t crc8_maxim(const uint8_t *data, size_t len) {
-    (void)data; (void)len;
-    /* TODO */
-    return 0;
+    /* NOTE: despite the function name, 
+    data provided in capture file tells this should be CRC8/BLUETOOTH variant. */
+
+    uint8_t crc = 0x00; 
+
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            if (crc & 0x01) {
+                crc = (uint8_t)((crc >> 1) ^ 0xE5); 
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return crc;
 }
 
 /* ------------------- MAIN (ne mijenjati bitno) ----------------------------- */
@@ -110,5 +259,3 @@ int main(int argc, char **argv) {
     fclose(f);
     return 0;
 }
-
-
